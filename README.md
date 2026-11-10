@@ -52,12 +52,31 @@ its `.gitlab-ci.yml`.
 ## What is in it and why
 
 The pipeline used to run on stock `hashicorp/terraform` and `apk add python3` in every
-apply job. This image does that once:
+apply job, its plan jobs added `jq`, and its `review:claude` job installed Claude Code on
+every run. This image does that once:
 
 | Component | Version | Note |
 |---|---|---|
 | `hashicorp/terraform` | **1.16.5** | Follows `TF_VERSION` of the consumer's `.gitlab-ci.yml`; Alpine 3.24 underneath |
-| `python3` (apk) | 3.14.x | For `publish_password.py`, which the apply job runs through `local-exec` to save generated user passwords to GitLab CI/CD variables |
+| `python3` (apk) | 3.14.x | For `publish_password.py`, which the apply job runs through `local-exec` to save generated user passwords to GitLab CI/CD variables, and for the review scripts |
+| Claude Code | **2.1.308** | `/usr/local/bin/claude`, the native `linux-*-musl` binary, for `review:claude`: Claude reviews the MR and a script posts the findings |
+| `libgcc`, `libstdc++` (apk) | 15.2.x | Runtime of the Claude Code binary on musl |
+| `ripgrep` (apk) | 15.1.x | Backs Claude Code's Grep and Glob tools |
+| `git` (apk) | 2.54.x | The review job builds the MR's diff and exports the commit. The base image has it too; listed so the job doesn't depend on that |
+| `jq` (apk) | 1.8.x | For `check_lost_resources.sh`, which the plan jobs run on the saved plan |
+
+The CA bundle (`ca-certificates`) and `wget` (busybox, through OpenSSL's `ssl_client`)
+come with Alpine itself; both `wget` and Python verify TLS against that bundle. There is no
+`curl`: the consumer's scripts use Python's `urllib`, and the build downloads with `wget`.
+
+Claude Code makes the image about 290 MB bigger (~480 MB instead of ~190 MB): the
+binary alone is 285 MB.
+
+Claude Code is not installed with `install.sh`: that script needs `bash` and `curl`, and it
+always downloads the latest binary first and lets it install the pinned version. The
+Dockerfile downloads the pinned musl binary for the build platform (`TARGETARCH`) from
+`downloads.claude.ai` and checks it against the sha256 in that release's `manifest.json`,
+which is what `install.sh` does too.
 
 Each version is a build arg, so a version can be tried without editing the Dockerfile:
 
@@ -65,14 +84,16 @@ Each version is a build arg, so a version can be tried without editing the Docke
 docker build --build-arg TERRAFORM_VERSION=1.17.1 -t clickhouse-access:test .
 ```
 
-`python3` is pinned to major.minor (`python3~=3.14`), not to an exact `-rN` build:
+The apk packages are pinned to major.minor (`python3~=3.14`), not to an exact `-rN` build:
 Alpine drops old builds from its repositories, so an exact pin stops building, while an
 unpinned `apk add` fails hadolint (DL3018) in the release workflow. A new Terraform
-version can move to a new Alpine branch with a different Python. If the build then fails
-with `python3~=3.14` unsatisfiable, raise `PYTHON_VERSION` to what that branch ships:
+version can move to a new Alpine branch with other versions. If the build then fails with
+a package unsatisfiable, raise its build arg (`PYTHON_VERSION`, `GIT_VERSION`,
+`JQ_VERSION`, `GCC_VERSION`, `RIPGREP_VERSION`) to what that branch ships:
 
 ```bash
-docker run --rm --entrypoint sh hashicorp/terraform:<version> -c 'apk update -q && apk policy python3'
+docker run --rm --entrypoint sh hashicorp/terraform:<version> \
+  -c 'apk update -q && apk policy python3 git jq libgcc libstdc++ ripgrep'
 ```
 
 ## Contract for consumers
@@ -80,15 +101,27 @@ docker run --rm --entrypoint sh hashicorp/terraform:<version> -c 'apk update -q 
 1. **The entrypoint is `terraform`**, as upstream: `docker run ... clickhouse-access:1.16.5-1 version`.
    GitLab CI has to keep `entrypoint: [""]` in `image:`, otherwise the runner's shell
    script is passed to `terraform` as arguments.
-2. **Python is the standard library only.** There is no pip. A script that needs a
+2. **Claude Code needs `USE_BUILTIN_RIPGREP=0`.** The bundled ripgrep is built for glibc,
+   so on musl Claude Code has to use the system one. The image sets it, with
+   `DISABLE_AUTOUPDATER=1`, as `ENV`; a job that clears the environment, as `review:claude`
+   does with `env -i`, passes both again. Without it Grep and Glob don't work.
+3. **Python is the standard library only.** There is no pip. A script that needs a
    third-party package needs a new image version, not a `pip install` in the job.
-3. **Providers are not baked in.** `terraform init` still downloads them, pinned by each
+4. **Providers are not baked in.** `terraform init` still downloads them, pinned by each
    layer's lock file; cache them in CI with `TF_PLUGIN_CACHE_DIR`.
-4. **It runs as root**, like the upstream image.
+5. **It runs as root**, like the upstream image.
 
 ## Bumping Terraform
 
-1. Change `TERRAFORM_VERSION` in the [`Dockerfile`](Dockerfile), and `PYTHON_VERSION` if the
+1. Change `TERRAFORM_VERSION` in the [`Dockerfile`](Dockerfile), and the package pins if the
    new base image is on another Alpine branch (see above).
 2. Merge to `main`, tag `<new version>-1` and approve the release.
+3. In the consumer, change the image tag in `.gitlab-ci.yml`.
+
+## Bumping Claude Code
+
+1. Change `CLAUDE_CODE_VERSION` in the [`Dockerfile`](Dockerfile). The build fails if the
+   release has no musl binary for a platform or its checksum doesn't match.
+2. Merge to `main`, tag the next build of the same Terraform version (`1.16.5-3` after
+   `1.16.5-2`) and approve the release.
 3. In the consumer, change the image tag in `.gitlab-ci.yml`.
